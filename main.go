@@ -1,15 +1,23 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+)
+
+const (
+	Attempts int = iota
+	Retry
 )
 
 type Server struct {
@@ -53,15 +61,60 @@ func (p *ServerPool) NextServer() *Server {
 	return nil
 }
 
-func loadBalance(w http.ResponseWriter, r *http.Request) {
-	server := serverPool.NextServer()
+// SetServerStatus changes a status of a server
+func (p *ServerPool) SetServerStatus(url *url.URL, alive bool) {
+	for _, s := range p.servers {
+		if s.URL.String() == url.String() {
+			s.Alive = alive
+			break
+		}
+	}
+}
 
+func loadBalance(w http.ResponseWriter, r *http.Request) {
+	attempts := GetAttemptsFromContext(r)
+	if attempts > 3 {
+		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	server := serverPool.NextServer()
 	if server != nil {
 		server.ReverseProxy.ServeHTTP(w, r)
 		return
 	}
 
 	http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+}
+
+func GetRetriesFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value(Retry).(int); ok {
+		return retry
+	}
+
+	return 0
+}
+
+func GetAttemptsFromContext(r *http.Request) int {
+	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+		return attempts
+	}
+
+	return 1
+}
+
+func isServerAlive(u *url.URL) bool {
+	timeout := 1 * time.Second
+
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	if err != nil {
+		log.Println("Site unreachable, error: ", err)
+		return false
+	}
+
+	_ = conn.Close()
+	return true
 }
 
 var serverPool ServerPool
@@ -90,6 +143,28 @@ func main() {
 
 		// initialize reverse proxy
 		reverseProxy := httputil.NewSingleHostReverseProxy(serverUrl)
+
+		reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
+			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
+			retries := GetRetriesFromContext(r)
+
+			if retries < 3 {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					ctx := context.WithValue(r.Context(), Retry, retries+1)
+					reverseProxy.ServeHTTP(w, r.WithContext(ctx))
+				}
+				return
+			}
+
+			// after 3 retries, set server status as down
+			serverPool.SetServerStatus(serverUrl, false)
+
+			attempts := GetAttemptsFromContext(r)
+			log.Printf("%s(%s) Attempting retry %d\n", r.RemoteAddr, r.URL.Path, attempts)
+			ctx := context.WithValue(r.Context(), Attempts, attempts+1)
+			loadBalance(w, r.WithContext(ctx))
+		}
 
 		// add server to ServerPool
 		serverPool.AddServer(&Server{URL: serverUrl, Alive: true, ReverseProxy: reverseProxy})

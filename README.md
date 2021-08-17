@@ -1,4 +1,6 @@
-ToyLB
+### ToyLB
+
+Based on tutorial https://kasvith.me/posts/lets-create-a-simple-lb-go/
 
 ```
 Usage:
@@ -8,14 +10,14 @@ Usage:
         Serving Port
 ```
 
-Running the code
+### Running the code
 
 ```
   go build -o toylb .
   toylb --backends=http://localhost:8081,http://localhost:8082,http://localhost:8083
 ```
 
-Docker Example:
+### Docker Example:
 
 ```
 docker-compose up

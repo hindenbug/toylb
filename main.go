@@ -36,6 +36,12 @@ func (s *Server) IsAlive() bool {
 	return s.Alive
 }
 
+func (s *Server) SetAlive(alive bool) {
+	s.mux.Lock()
+	s.Alive = alive
+	s.mux.Unlock()
+}
+
 func (p *ServerPool) AddServer(server *Server) {
 	p.servers = append(p.servers, server)
 }
@@ -108,13 +114,36 @@ func isServerAlive(u *url.URL) bool {
 	timeout := 1 * time.Second
 
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+
 	if err != nil {
 		log.Println("Site unreachable, error: ", err)
 		return false
 	}
 
-	_ = conn.Close()
+	defer conn.Close()
+
 	return true
+}
+
+func (p *ServerPool) HealthCheck() {
+	t := time.NewTicker(time.Second * 20)
+	for {
+		select {
+		case <-t.C:
+			log.Println("Starting Health Check....")
+
+			for _, s := range p.servers {
+				alive := isServerAlive(s.URL)
+				s.SetAlive(alive)
+				if alive {
+					log.Printf("%s [%s]\n", s.URL, "UP")
+				} else {
+					log.Printf("%s [%s]\n", s.URL, "DOWN")
+				}
+			}
+			log.Println("Health check done.")
+		}
+	}
 }
 
 var serverPool ServerPool
@@ -176,6 +205,9 @@ func main() {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(loadBalance),
 	}
+
+	// start health checks
+	go serverPool.HealthCheck()
 
 	log.Printf("Load Balancer started at :%d\n", port)
 	if err := server.ListenAndServe(); err != nil {

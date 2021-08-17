@@ -10,89 +10,19 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
+
+var serverPool ServerPool
+
+const PORT uint = 8080
+const MAX_RETRIES = 3
+const MAX_ATTEMPTS = 3
 
 const (
 	Attempts int = iota
 	Retry
 )
-
-type Server struct {
-	URL          *url.URL
-	Alive        bool
-	mux          sync.RWMutex
-	ReverseProxy *httputil.ReverseProxy
-}
-
-type ServerPool struct {
-	servers []*Server
-	current uint64
-}
-
-func (s *Server) IsAlive() bool {
-	return s.Alive
-}
-
-func (s *Server) SetAlive(alive bool) {
-	s.mux.Lock()
-	s.Alive = alive
-	s.mux.Unlock()
-}
-
-func (p *ServerPool) AddServer(server *Server) {
-	p.servers = append(p.servers, server)
-}
-
-func (p *ServerPool) AliveServerIndex() int {
-	return int(atomic.AddUint64(&p.current, uint64(1)) % uint64(len(p.servers)))
-}
-
-// get the Next alive server
-func (p *ServerPool) NextServer() *Server {
-	nextIndex := int(atomic.AddUint64(&p.current, uint64(1)))
-	l := len(p.servers) + nextIndex
-
-	for i := nextIndex; i < l; i++ {
-		next := i % len(p.servers)
-		if p.servers[next].IsAlive() {
-			if i != nextIndex {
-				atomic.StoreUint64(&p.current, uint64(next))
-			}
-			return p.servers[next]
-		}
-	}
-	return nil
-}
-
-// SetServerStatus changes a status of a server
-func (p *ServerPool) SetServerStatus(url *url.URL, alive bool) {
-	for _, s := range p.servers {
-		if s.URL.String() == url.String() {
-			s.Alive = alive
-			break
-		}
-	}
-}
-
-func loadBalance(w http.ResponseWriter, r *http.Request) {
-	attempts := GetAttemptsFromContext(r)
-	if attempts > 3 {
-		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	server := serverPool.NextServer()
-	if server != nil {
-		server.ReverseProxy.ServeHTTP(w, r)
-		return
-	}
-
-	http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-}
 
 func GetRetriesFromContext(r *http.Request) int {
 	if retry, ok := r.Context().Value(Retry).(int); ok {
@@ -121,38 +51,31 @@ func isServerAlive(u *url.URL) bool {
 	}
 
 	defer conn.Close()
-
 	return true
 }
 
-func (p *ServerPool) HealthCheck() {
-	t := time.NewTicker(time.Second * 20)
-	for {
-		select {
-		case <-t.C:
-			log.Println("Starting Health Check....")
-
-			for _, s := range p.servers {
-				alive := isServerAlive(s.URL)
-				s.SetAlive(alive)
-				if alive {
-					log.Printf("%s [%s]\n", s.URL, "UP")
-				} else {
-					log.Printf("%s [%s]\n", s.URL, "DOWN")
-				}
-			}
-			log.Println("Health check done.")
-		}
+func loadBalance(w http.ResponseWriter, r *http.Request) {
+	attempts := GetAttemptsFromContext(r)
+	if attempts > MAX_ATTEMPTS {
+		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
 	}
-}
 
-var serverPool ServerPool
+	server := serverPool.NextServer()
+	if server != nil {
+		server.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+
+	http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+}
 
 func main() {
 	var serverList string
-	var port int
+	var port uint
 	flag.StringVar(&serverList, "servers", "", "Backends attached to the load balancer, use commas to separate")
-	flag.IntVar(&port, "port", 8080, "Serving port")
+	flag.UintVar(&port, "port", PORT, "Serving port")
 	flag.Parse()
 
 	if len(serverList) == 0 {
@@ -177,7 +100,7 @@ func main() {
 			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
 			retries := GetRetriesFromContext(r)
 
-			if retries < 3 {
+			if retries < MAX_RETRIES {
 				select {
 				case <-time.After(10 * time.Millisecond):
 					ctx := context.WithValue(r.Context(), Retry, retries+1)
@@ -213,5 +136,4 @@ func main() {
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
-
 }
